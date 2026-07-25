@@ -58,6 +58,10 @@ Soroban Smart Block Explorer decodes contract calls on the fly using an ABI-like
 
 ---
 
+### Architecture Decision Records
+
+- [ADR index](docs/adr/README.md) for the six core design choices behind the explorer.
+
 ## Quick Start
 
 ### Prerequisites
@@ -72,8 +76,17 @@ Soroban Smart Block Explorer decodes contract calls on the fly using an ABI-like
 ```bash
 git clone https://github.com/your-org/Soroban-Smart-Block
 cd Soroban-Smart-Block
+
+# Root .env — used by Docker Compose
 cp .env.example .env
-# Edit .env with your RPC URL and DATABASE_URL
+
+# Indexer .env — used when running the indexer directly (npm start)
+cp indexer/.env.example indexer/.env
+
+# Frontend .env — sets the indexer URL for the Vite dev server
+cp frontend/.env.example frontend/.env
+
+# Edit all three files with your RPC URL, DATABASE_URL, and CONTRACT_ID
 ```
 
 ### 2. Build & deploy the contract
@@ -85,6 +98,12 @@ make deploy     # deploy to testnet, prints CONTRACT_ID
 ```
 
 Copy the printed contract ID into `.env` as `EXPLORER_CONTRACT_ID`.
+
+#### Deployed Contracts
+
+| Network | Contract ID | Explorer |
+|---|---|---|
+| Testnet | `CDA2ZCIB3ETZNFNQP4NS3SIEW5XCF7DKP5UWN4Y33F5FV34JA2CGAJ44` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CDA2ZCIB3ETZNFNQP4NS3SIEW5XCF7DKP5UWN4Y33F5FV34JA2CGAJ44) |
 
 ### 3. Start the indexer + API
 
@@ -111,6 +130,8 @@ make dev
 ---
 
 ## Contract API
+
+- Rustdoc reference: https://soroban-smart-block-explorer.github.io/Soroban-Smart-Block/docs/reference/contract/soroban_explorer_contract/
 
 | Function                                       | Description                            |
 | ---------------------------------------------- | -------------------------------------- |
@@ -228,6 +249,8 @@ The decoder recognises SEP-41 token events (`transfer`, `mint`, `burn`) and form
 ## Documentation
 
 A full developer documentation site lives under [`docs/`](docs/):
+
+- [Architecture Decision Records](docs/adr/README.md) — rationale for the six core design choices behind the explorer.
 
 - [Documentation home](docs/site/index.html) — guides, reference, and search.
 - [Getting started](docs/guides/getting-started.md) and other step-by-step guides.

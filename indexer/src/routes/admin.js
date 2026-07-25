@@ -31,6 +31,7 @@ import {
 import { getRedisClient } from '../rateLimit/tokenBucket.js';
 import { db, pool } from '../db.js';
 import { runAllChecks } from '../doctor-lib.js';
+import { getActiveAlerts, resolveAlert } from '../alertManager.js';
 
 // ── CSV helpers ───────────────────────────────────────────────────────────────
 
@@ -100,9 +101,7 @@ function rowsToCsv(rows, columns) {
  */
 export default function registerAdminRoutes(app) {
   // ── Legacy utility routes (no auth) ───────────────────────────────────────
-  // These existed before the auth system and are preserved for compatibility.
-  app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-
+  // /health is registered by api.js (comprehensive check via health.js). Skip it here.
   app.get('/api/doctor', async (_req, res) => {
     try {
       const checks = await runAllChecks();
@@ -115,8 +114,6 @@ export default function registerAdminRoutes(app) {
   app.post('/api/setup/db-init', async (req, res) => {
     try {
       await db.init();
-      const { seed } = await import('../seed-lib.js');
-      await seed(process.env.DATABASE_URL);
       res.json({ success: true });
     } catch (e) {
       res.status(500).json({ error: e.message });
@@ -168,6 +165,15 @@ export default function registerAdminRoutes(app) {
 
   // Apply admin auth to all routes on this router.
   router.use(adminAuthMiddleware);
+
+  // ── POST /api/admin/alerts/:condition/resolve ─────────────────────────────
+  router.post('/alerts/:condition/resolve', (req, res) => {
+    const { condition } = req.params;
+    const resolved = getActiveAlerts().some((alert) => alert.condition === condition);
+
+    resolveAlert(condition);
+    res.json({ condition, resolved });
+  });
 
   // ── GET /api/admin/api-keys ────────────────────────────────────────────────
   router.get('/api-keys', async (req, res) => {

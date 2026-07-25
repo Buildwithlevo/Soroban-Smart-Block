@@ -1,5 +1,12 @@
 import pg from "pg";
 import { runMigrations } from "./migrate.js";
+import { validateAndSanitizeDecodedEvent } from "./decoderValidator.js";
+
+// BIGINT/BIGSERIAL (OID 20) columns — seq, ledger — are returned as JS
+// strings by default to avoid silent precision loss above 2^53. Ledger and
+// event sequence numbers stay well within that range, and the OpenAPI schema
+// documents these fields as `integer`, so parse them as numbers.
+pg.types.setTypeParser(20, (val) => parseInt(val, 10));
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -31,6 +38,45 @@ export const db = {
     return rows[0] ? Number(rows[0].value) : null;
   },
 
+  // ── ledger reorganization state ───────────────────────────────
+  async recordLedgerHash(ledger, hash) {
+    await pool.query(
+      `INSERT INTO ledger_hashes (ledger, hash)
+       VALUES ($1, $2)
+       ON CONFLICT (ledger) DO NOTHING`,
+      [ledger, hash],
+    );
+  },
+
+  async getRecentLedgerHashes(limit) {
+    const { rows } = await pool.query(
+      "SELECT ledger, hash FROM ledger_hashes ORDER BY ledger DESC LIMIT $1",
+      [limit],
+    );
+    return rows;
+  },
+
+  /** Atomically purge orphaned data and persist the daemon rewind cursor. */
+  async rollbackFromLedger(forkLedger) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM events WHERE ledger >= $1", [forkLedger]);
+      await client.query("DELETE FROM ledger_hashes WHERE ledger >= $1", [forkLedger]);
+      await client.query(
+        `INSERT INTO daemon_state (key, value) VALUES ('cursor', $1)
+         ON CONFLICT (key) DO UPDATE SET value = $1`,
+        [String(forkLedger)],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+
   // ── cursor-based pagination ────────────────────────────────────
   /**
    * Return a page of events using keyset (cursor-based) pagination.
@@ -40,9 +86,10 @@ export const db = {
    *           after_seq?: number, limit?: number }} opts
    *   after_seq — the `seq` of the last event on the previous page (opaque cursor).
    *               Omit (or pass 0) for the first page.
+   * @param {boolean} [failed]  Filter by failure status (#566)
    * @returns {{ data: object[], next_cursor: number|null }}
    */
-  async getEventsCursor({ contract, fn, type, after_seq = 0, limit = 25 } = {}) {
+  async getEventsCursor({ contract, fn, type, after_seq = 0, limit = 25, failed } = {}) {
     const conditions = [];
     const params = [];
 
@@ -59,6 +106,12 @@ export const db = {
     }
     if (type === "classic") {
       conditions.push(`(contract_id IS NULL OR contract_id = '')`);
+    }
+    // #566: filter failed events
+    if (failed === true) {
+      conditions.push(`is_failed = TRUE`);
+    } else if (failed === false) {
+      conditions.push(`is_failed = FALSE`);
     }
 
     // Keyset: fetch rows with seq < after_seq (descending) or all rows for first page
@@ -77,7 +130,8 @@ export const db = {
 
     const hasMore = rows.length > limit;
     const data = hasMore ? rows.slice(0, limit) : rows;
-    const next_cursor = hasMore ? data[data.length - 1].seq : null;
+    // seq is BIGINT so pg returns it as a string — coerce for a numeric cursor
+    const next_cursor = hasMore ? Number(data[data.length - 1].seq) : null;
 
     return { data, next_cursor };
   },
@@ -87,8 +141,9 @@ export const db = {
       `INSERT INTO events
          (contract_id, function, ledger, tx_hash, description, raw_topics, raw_data,
           cpu_instructions, mem_bytes, fee_charged, is_high_bloat_risk, upgrade_info, storage_tiers, is_clawback,
-          footprint_contention, ttl_extension, fee_bump, archival_info, zk_host_calls)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+          footprint_contention, ttl_extension, fee_bump, archival_info, zk_host_calls, abi_version,
+          is_failed, failure_reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
        ON CONFLICT DO NOTHING`,
       [
         ev.contract_id,
@@ -110,10 +165,85 @@ export const db = {
         ev.fee_bump ? JSON.stringify(ev.fee_bump) : null,
         ev.archival_info ? JSON.stringify(ev.archival_info) : null,
         ev.zk_host_calls ? JSON.stringify(ev.zk_host_calls) : null,
+        ev.abi_version ?? 0,
+        ev.is_failed ?? false,
+        ev.failure_reason ?? null,
       ],
     );
   },
 
+  async markNeedsRedecode(contractId, newAbiVersion) {
+    if (!contractId || !Number.isInteger(Number(newAbiVersion)) || Number(newAbiVersion) < 0) {
+      throw new Error("contractId and a non-negative ABI version are required");
+    }
+    const { rowCount } = await pool.query(
+      `UPDATE events
+       SET needs_redecode = TRUE
+       WHERE contract_id = $1 AND abi_version < $2 AND needs_redecode = FALSE`,
+      [contractId, Number(newAbiVersion)],
+    );
+    return rowCount ?? 0;
+  },
+
+  async getEventsNeedingRedecode(limit = 100) {
+    const safeLimit = Number(limit);
+    if (!Number.isInteger(safeLimit) || safeLimit < 1 || safeLimit > 1000) {
+      throw new Error("redecode batch size must be between 1 and 1000");
+    }
+    const { rows } = await pool.query(
+      `SELECT seq, contract_id, function, ledger, tx_hash, raw_topics, raw_data, abi_version
+       FROM events
+       WHERE needs_redecode = TRUE
+       ORDER BY seq ASC
+       LIMIT $1`,
+      [safeLimit],
+    );
+    return rows;
+  },
+
+  async updateRedecodedEvent(seq, decoded, abiVersion) {
+    await pool.query(
+      `UPDATE events
+       SET function = $2,
+           description = $3,
+           raw_topics = $4,
+           raw_data = $5,
+           abi_version = $6,
+           needs_redecode = FALSE
+       WHERE seq = $1 AND needs_redecode = TRUE`,
+      [
+        seq,
+        decoded.function,
+        decoded.description,
+        JSON.stringify(decoded.raw_topics),
+        decoded.raw_data,
+        abiVersion,
+      ],
+    );
+  },
+
+  /**
+   * Validate and sanitize a decoded event, then insert into the database.
+   * On validation failure:
+   * - Sets decoded=false to mark as unverified
+   * - Sanitizes description to prevent corruption (strips HTML, control chars, limits length)
+   * - Logs structured error with failing field paths
+   * - Increments decoder_schema_violations_total metric
+   * - Still inserts the record with sanitized data (corruption guard)
+   *
+   * @param {object} ev - The decoded event object from decoder
+   * @param {object} logger - Optional logger instance (defaults to console)
+   */
+  async upsertEventValidated(ev, logger) {
+    const validated = validateAndSanitizeDecodedEvent(ev, logger);
+    await this.upsertEvent(validated);
+  },
+
+  /**
+   * @deprecated OFFSET pagination degrades to a full-table scan at depth on
+   * large tables — use getEventsCursor() instead (#490). Kept only for the
+   * page-based GET /api/contracts/:id/events endpoint.
+   */
   async getEvents({ contract, fn, page = 1, limit = 25, type } = {}) {
     const conditions = [];
     const params = [];
@@ -125,7 +255,7 @@ export const db = {
       params.push(fn);
       conditions.push(`function = $${params.length}`);
     }
-    filter by transaction type
+    // filter by transaction type
     // "soroban"  → contract_id is non-empty (Soroban invocations/deployments)
     // "classic"  → contract_id is empty string or NULL
     if (type === "soroban") {
@@ -145,7 +275,8 @@ export const db = {
   },
 
   async getEvent(seq) {
-    const { rows } = await pool.query("SELECT * FROM events WHERE seq = $1", [seq]);
+    const sql = "SELECT * FROM events WHERE seq = $1";
+    const { rows } = await pool.query(sql, [seq]);
     return rows[0] ?? null;
   },
 
@@ -351,8 +482,31 @@ export const db = {
     ].slice(0, limitN);
   },
 
+  async listContracts({ page = 1, limit = 25 } = {}) {
+    const offset = (page - 1) * limit;
+    const [{ rows }, { rows: countRows }] = await Promise.all([
+      pool.query(
+        `SELECT id, name, description, registered_by, has_circuit_breaker, is_paused, is_rwa, rwa_type, created_at
+         FROM contracts ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+        [limit, offset],
+      ),
+      pool.query("SELECT COUNT(*)::INT AS total FROM contracts"),
+    ]);
+    const total = countRows[0].total;
+    return {
+      contracts: rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit),
+      },
+    };
+  },
+
   async getContractMeta(id) {
-    const { rows } = await pool.query("SELECT * FROM contracts WHERE id = $1", [id]);
+    const sql = "SELECT * FROM contracts WHERE id = $1";
+    const { rows } = await pool.query(sql, [id]);
     return rows[0] ?? null;
   },
 
@@ -443,9 +597,9 @@ export const db = {
 
   async upsertContractMeta(meta) {
     await pool.query(
-      `INSERT INTO contracts (id, name, description, functions, registered_by, source_files, has_circuit_breaker, is_rwa, rwa_type, version)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT (id) DO UPDATE SET name=$2, description=$3, functions=$4, source_files=$6, has_circuit_breaker=$7, is_rwa=$8, rwa_type=$9, version=$10`,
+      `INSERT INTO contracts (id, name, description, functions, registered_by, source_files, has_circuit_breaker, is_rwa, rwa_type, version, abi_version, min_ledger)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (id) DO UPDATE SET name=$2, description=$3, functions=$4, source_files=$6, has_circuit_breaker=$7, is_rwa=$8, rwa_type=$9, version=$10, abi_version=$11, min_ledger=$12`,
       [
         meta.id,
         meta.name,
@@ -457,11 +611,47 @@ export const db = {
         meta.is_rwa ?? false,
         meta.rwa_type ?? null,
         meta.version ?? 1,
+        meta.abi_version ?? 0,
+        meta.min_ledger ?? 0,
       ],
     );
+
+    // Also store in version history if abi_version is provided
+    if (meta.abi_version != null) {
+      await pool.query(
+        `INSERT INTO contract_versions (contract_id, abi_version, min_ledger, name, description, functions, registered_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT DO NOTHING`,
+        [
+          meta.id,
+          meta.abi_version,
+          meta.min_ledger ?? 0,
+          meta.name,
+          meta.description,
+          JSON.stringify(meta.functions),
+          meta.registered_by,
+        ],
+      );
+    }
   },
 
-  Circuit breaker status tracking
+  /**
+   * Fetch contract metadata that was active at a given ledger.
+   * Returns the version whose min_ledger <= target_ledger, ordered by
+   * abi_version descending (latest applicable version wins).
+   */
+  async getContractMetaByLedger(contractId, targetLedger) {
+    const { rows } = await pool.query(
+      `SELECT * FROM contract_versions
+       WHERE contract_id = $1 AND min_ledger <= $2
+       ORDER BY abi_version DESC
+       LIMIT 1`,
+      [contractId, targetLedger],
+    );
+    return rows[0] ?? null;
+  },
+
+  // Circuit breaker status tracking
   async updateCircuitBreakerStatus(contractId, isPaused, ledger) {
     await pool.query(`UPDATE contracts SET is_paused = $1, pause_status_ledger = $2 WHERE id = $3`, [
       isPaused,
@@ -823,7 +1013,81 @@ export const db = {
     );
   },
 
-  data export — events (CSV/JSON)
+  // ── Predictive Gap Detection helpers ────────────────────────────────────────
+
+  /**
+   * Return the most recently indexed ledger numbers, newest first.
+   * Used by the predictive gap detector to find missing ranges.
+   *
+   * @param {number} n  Maximum number of ledgers to return
+   * @returns {Promise<number[]>}  Descending array of ledger numbers
+   */
+  async getRecentLedgers(n = 100) {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ledger FROM events ORDER BY ledger DESC LIMIT $1`,
+      [n],
+    );
+    return rows.map((r) => Number(r.ledger));
+  },
+
+  /**
+   * Insert a gap record into the gap_log table.
+   *
+   * @param {{ from: number, to: number, size: number, status?: string }} gap
+   * @returns {Promise<number>}  The new gap_log id
+   */
+  async insertGapLog(gap) {
+    const { rows } = await pool.query(
+      `INSERT INTO gap_log (from_ledger, to_ledger, size, status)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [gap.from, gap.to, gap.size, gap.status ?? "open"],
+    );
+    return rows[0].id;
+  },
+
+  /**
+   * Update the status of a gap_log entry.
+   *
+   * @param {number} id
+   * @param {string} status  "closed" | "failed" | "pending"
+   */
+  async updateGapLogStatus(id, status) {
+    await pool.query(
+      `UPDATE gap_log SET status = $1, closed_at = NOW(), updated_at = NOW() WHERE id = $2`,
+      [status, id],
+    );
+  },
+
+  /**
+   * Get pending gaps (sorted by from_ledger ascending).
+   *
+   * @returns {Promise<{ id: number, from: number, to: number, size: number }[]>}
+   */
+  async getPendingGaps() {
+    const { rows } = await pool.query(
+      `SELECT id, from_ledger AS "from", to_ledger AS "to", size
+       FROM gap_log
+       WHERE status = 'open'
+       ORDER BY from_ledger ASC`,
+    );
+    return rows;
+  },
+
+  /**
+   * Count gaps closed in the last 24 hours.
+   *
+   * @returns {Promise<number>}
+   */
+  async getClosedGapCount24h() {
+    const { rows } = await pool.query(
+      `SELECT COUNT(*)::INT AS total FROM gap_log
+       WHERE status = 'closed' AND closed_at >= NOW() - INTERVAL '24 hours'`,
+    );
+    return rows[0].total;
+  },
+
+  // data export — events (CSV/JSON)
   async getEventsForExport({ contract, fn, type, limit = 10000 } = {}) {
     const conditions = [];
     const params = [];
@@ -852,7 +1116,7 @@ export const db = {
     return rows;
   },
 
-  data export — registered contracts (CSV/JSON)
+  // data export — registered contracts (CSV/JSON)
   async getContractsForExport() {
     const { rows } = await pool.query(
       `SELECT id, name, description, registered_by, has_circuit_breaker, is_paused, is_rwa, rwa_type, created_at
@@ -872,6 +1136,92 @@ export const db = {
       [limit],
     );
     return rows;
+  },
+
+  // ── Gap detection helpers ──────────────────────────────────────────────
+
+  /**
+   * Return the N most recent distinct ledger numbers from the events table,
+   * ordered ascending. Used by the predictive gap detector to scan for gaps.
+   *
+   * @param {number} n  Number of recent ledgers to fetch (default 100)
+   * @returns {Promise<number[]>}  Sorted ascending array of ledger numbers
+   */
+  async getRecentLedgers(n = 100) {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ledger FROM events ORDER BY ledger DESC LIMIT $1`,
+      [n],
+    );
+    return rows.map((r) => Number(r.ledger)).sort((a, b) => a - b);
+  },
+
+  /**
+   * Insert a detected gap into the gap_log table.
+   * Returns the new row id.
+   */
+  async insertGapLog(from, to, size) {
+    const { rows } = await pool.query(
+      `INSERT INTO gap_log (from_ledger, to_ledger, size)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [from, to, size],
+    );
+    return rows[0].id;
+  },
+
+  /**
+   * Mark a gap_log entry as closed (successfully re-indexed).
+   */
+  async closeGapLog(id) {
+    await pool.query(
+      `UPDATE gap_log SET status = 'closed', closed_at = NOW() WHERE id = $1`,
+      [id],
+    );
+  },
+
+  /**
+   * Mark a gap_log entry as sent to the dead-letter queue after exhausting retries.
+   */
+  async dlqGapLog(id) {
+    await pool.query(
+      `UPDATE gap_log SET status = 'dlq', closed_at = NOW() WHERE id = $1`,
+      [id],
+    );
+  },
+
+  /**
+   * Increment the retry counter on a gap_log entry.
+   */
+  async incrementGapRetries(id) {
+    await pool.query(
+      `UPDATE gap_log SET retries = retries + 1 WHERE id = $1`,
+      [id],
+    );
+  },
+
+  /**
+   * Return gap stats for the GET /api/gaps endpoint.
+   */
+  async getGapLogStats() {
+    const [pending, closed24h] = await Promise.all([
+      pool.query(
+        `SELECT from_ledger, to_ledger, size FROM gap_log
+         WHERE status = 'open'
+         ORDER BY from_ledger ASC`,
+      ),
+      pool.query(
+        `SELECT COUNT(*)::INT AS total FROM gap_log
+         WHERE status = 'closed' AND closed_at >= NOW() - INTERVAL '24 hours'`,
+      ),
+    ]);
+    return {
+      pending: pending.rows.map((r) => ({
+        from: Number(r.from_ledger),
+        to: Number(r.to_ledger),
+        size: Number(r.size),
+      })),
+      closed_last_24h: closed24h.rows[0].total,
+    };
   },
 };
 
